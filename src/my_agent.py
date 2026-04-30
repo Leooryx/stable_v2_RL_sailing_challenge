@@ -6,7 +6,8 @@ The agent uses a discretized state space and a Q-table for decision making.
 """
 
 import numpy as np
-from evaluator.base_agent import BaseAgent
+from agents.base_agent import BaseAgent
+#from evaluator.base_agent import BaseAgent
 
 class MyAgent(BaseAgent):
     """
