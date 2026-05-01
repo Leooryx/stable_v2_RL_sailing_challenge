@@ -10,17 +10,14 @@ from src.agents.base_agent import BaseAgent
 from src.env_sailing import SailingEnv
 from src.wind_scenarios import get_wind_scenario
 
-# if needed
+# if the ersion of cuda is too old, to this:
 """
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 
 if torch.cuda.is_available():
-    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
-    print(f"CUDA Version PyTorch is using: {torch.version.cuda}")
-else:
-    print("GPU not detected. Check your installation steps.")
-
+    print(f"GPU name: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA version PyTorch is using: {torch.version.cuda}")
 
 pip uninstall torch torchvision torchaudio
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
@@ -177,9 +174,9 @@ ql_agent = MyAgent()
 
 np.random.seed(42)
 ql_agent.seed(42)
-scenarios = ['training_1', 'training_2']
+scenarios = ['training_1', 'training_2', 'training_3']
 max_steps = 500
-num_episodes = 600
+num_episodes = 2000 #TO BE CHANGED TO 2000
 
 rewards_history = []
 steps_history = []
@@ -188,7 +185,7 @@ success_history = []
 print(f"Starting training on device: {ql_agent.device}")
 
 for episode in tqdm(range(num_episodes)):
-    scenario = scenarios[episode % 2]
+    scenario = scenarios[episode % 3]
     env = SailingEnv(**get_wind_scenario(scenario))
     goal = env.goal_position.copy()
     
@@ -204,9 +201,20 @@ for episode in tqdm(range(num_episodes)):
     for step in range(max_steps):
         action = ql_agent.act(observation)
         next_observation, base_reward, done, truncated, info = env.step(action)
-        
-        # Using get_state instead of discretize_state
         next_state = ql_agent.get_state(next_observation)
+        
+        # wind-aware reward-shaping
+        
+        vx, vy = next_observation[2], next_observation[3]
+        wx, wy = next_observation[4], next_observation[5]
+        wind_angle = np.arctan2(wy, wx)
+        vel_angle = np.arctan2(vy, vx) 
+        diff = np.abs((vel_angle - wind_angle + np.pi) % (2 * np.pi) - np.pi) 
+
+        # penalty for the no-go zone (45 degrees = 0.78 radians bc arctan)
+        no_go_penalty = 0
+        if diff < 0.78:
+            no_go_penalty = -2.0  # discourages sailing directly into wind      
         
         curr_dist = np.linalg.norm(info['position'] - goal)
         
@@ -214,7 +222,7 @@ for episode in tqdm(range(num_episodes)):
         phi_curr = -prev_dist
         shaping_reward = (ql_agent.discount_factor * phi_next) - phi_curr
         
-        shaped_reward = base_reward + (shaping_reward * 0.2) 
+        shaped_reward = base_reward + (shaping_reward * 0.2) + no_go_penalty
         
         if info.get('is_stuck', False):
             shaped_reward -= 50.0
@@ -254,11 +262,24 @@ print(f"Overall success rate: {success_rate:.1f}%")
 
 
 # --- SAVING WEIGHTS ---
-# Since we are using PyTorch, saving requires exporting the model's state_dict
-# rather than pickling a python dictionary.
 output_path = 'src/my_agent_dqn.pth'
 torch.save(ql_agent.policy_net.state_dict(), output_path)
-print(f"Weights saved to {output_path}")
+
+import json
+def save_weights_as_text(model, filename="weights_dump.txt"):
+    # Convert every tensor to a nested Python list
+    # .cpu() ensures it's off the GPU, .tolist() converts to raw numbers
+    state_dict_raw = {k: v.cpu().tolist() for k, v in model.state_dict().items()}
+    
+    with open(filename, "w") as f:
+        f.write("RAW_WEIGHTS = ")
+        # Using json.dumps ensures no truncation and valid Python formatting
+        f.write(json.dumps(state_dict_raw))
+    
+    print(f"Full weights saved to {filename}. Open this file and copy everything!")
+
+# Run this
+save_weights_as_text(ql_agent.policy_net)
 
 
 # --- EVALUATION ---
@@ -273,7 +294,7 @@ for scenario in ['training_3']:
 
     print("Testing the trained agent on 5 new episodes...")
     for episode in range(num_test_episodes):
-        observation, info = test_env.reset(seed=1000 + episode) 
+        observation, info = test_env.reset(seed=22 + episode) 
         total_reward = 0
         
         for step in range(max_steps):
