@@ -50,7 +50,7 @@ class MyAgent(BaseAgent):
         self.np_random = np.random.default_rng()
         
         self.goal_position = [64, 127]
-        self.learning_rate = 1e-3  # Typically smaller for neural nets
+        self.learning_rate = 1e-3  
         self.discount_factor = 0.995
         self.exploration_rate = 0.5
         
@@ -79,7 +79,20 @@ class MyAgent(BaseAgent):
         vx, vy = observation[2], observation[3]
         wx, wy = observation[4], observation[5]
 
-        # Danger radar logic (kept exactly as in your original code)
+        # 1. Goal-Directed Features
+        dx, dy = self.goal_position[0] - x, self.goal_position[1] - y
+        dx, dy = dx/128, dy/128 #distance normalization
+        dist_to_goal = np.sqrt(dx**2 + dy**2)
+        angle_to_goal = np.arctan2(dy, dx)
+
+        #relative coordinates are supposed to be better for neural networks
+        wind_angle = np.arctan2(wy, wx)
+        velocity_angle = np.arctan2(vy, vx)
+        # Angle between boat movement and wind
+        relative_wind_angle = (velocity_angle - wind_angle + np.pi) % (2 * np.pi) - np.pi
+
+
+        # danger radar
         danger = 0.0
         speed = np.sqrt(vx**2 + vy**2)
         if speed > 0.1:
@@ -89,8 +102,8 @@ class MyAgent(BaseAgent):
             if map_idx < len(observation) and observation[map_idx] == 1:
                 danger = 1.0
         
-        # Normalize x and y to roughly [0, 1] to help the neural network train faster
-        return np.array([x / 128.0, y / 128.0, vx, vy, wx, wy, danger], dtype=np.float32)
+        
+        return np.array([dist_to_goal, angle_to_goal, vx, vy, relative_wind_angle, wind_angle, danger], dtype=np.float32)
         
     def act(self, observation):
         state = self.get_state(observation)
@@ -221,7 +234,15 @@ for episode in tqdm(range(num_episodes)):
     steps_history.append(step + 1)
     success_history.append(done)
     
-    ql_agent.exploration_rate = max(0.01, ql_agent.exploration_rate * 0.995)
+    # success-based exploration decay
+    recent_success_rate = sum(success_history[-20:]) / 20.0
+
+    if recent_success_rate < 0.1:
+        # If we are failing, keep exploration high to find the goal
+        ql_agent.exploration_rate = max(0.2, ql_agent.exploration_rate)
+    else:
+        # If we are succeeding, decay exploration to refine the policy
+        ql_agent.exploration_rate = max(0.01, ql_agent.exploration_rate * 0.99)
     
     if (episode + 1) % 200 == 0:
         recent = success_history[-200:]
