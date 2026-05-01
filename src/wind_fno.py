@@ -366,7 +366,7 @@ def load_fno(weights_path: Path = WEIGHTS_PATH) -> "WindFNOInference":
 
 class WindFNOInference:
     """
-    CPU-friendly inference wrapper around WindFNO.
+    GPU-enabled inference wrapper around WindFNO.
 
     Handles normalisation/denormalisation internally so callers
     work in the same units as the environment (raw wind vectors).
@@ -378,17 +378,26 @@ class WindFNOInference:
     """
 
     def __init__(self, weights_path: Path):
-        ck = torch.load(weights_path, map_location="cpu")
+        # 1. Automatically detect GPU
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 2. Load checkpoint directly to the detected device
+        ck = torch.load(weights_path, map_location=self.device)
+        
         self.model = WindFNO(
             modes_x=ck["modes_x"],
             modes_y=ck["modes_y"],
             width=ck["width"],
         )
         self.model.load_state_dict(ck["model_state"])
+        
+        # 3. Move the model to the GPU
+        self.model.to(self.device)
         self.model.eval()
 
-        self.mean = ck["mean"]   # (1,1,1,2)
-        self.std  = ck["std"]    # (1,1,1,2)
+        # 4. Move normalization tensors to the GPU
+        self.mean = ck["mean"].to(self.device)   # (1,1,1,2)
+        self.std  = ck["std"].to(self.device)    # (1,1,1,2)
 
     def predict(self, wind_field_np: np.ndarray, steps: int = 5) -> np.ndarray:
         """
@@ -402,14 +411,18 @@ class WindFNOInference:
             (steps, 128, 128, 2) numpy array — predicted future fields
             Index 0 = t+1, index 4 = t+5.
         """
-        x = torch.tensor(wind_field_np, dtype=torch.float32).unsqueeze(0)  # (1,H,W,2)
+        # 5. Send the input numpy array to the GPU as a tensor
+        x = torch.tensor(wind_field_np, dtype=torch.float32).unsqueeze(0).to(self.device)  # (1,H,W,2)
+        
         x_norm = (x - self.mean) / self.std
 
         with torch.no_grad():
             preds_norm = self.model.rollout(x_norm, steps=steps)   # (steps,H,W,2)
 
         preds = preds_norm * self.std.squeeze(0) + self.mean.squeeze(0)
-        return preds.numpy()
+        
+        # 6. Bring the resulting tensor back to the CPU before converting to NumPy
+        return preds.cpu().numpy()
 
 
 # =============================================================================
