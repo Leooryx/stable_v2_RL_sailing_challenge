@@ -5,6 +5,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import os
+import sys
+
+
+# Add the src directory to the path
+sys.path.append(os.path.abspath('../src'))
+sys.path.append(os.path.abspath('..'))
 
 from src.agents.base_agent import BaseAgent
 from src.env_sailing import SailingEnv
@@ -27,7 +34,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 class SimpleDQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(SimpleDQN, self).__init__()
-        # A simple 2-layer Multi-Layer Perceptron (MLP)
+        # A simple 2-layer MLP
         self.network = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
@@ -40,7 +47,6 @@ class SimpleDQN(nn.Module):
         return self.network(x)
 
 
-# 2. Define the Deep Q-Learning Agent
 class MyAgent(BaseAgent):
     def __init__(self):
         super().__init__()
@@ -262,7 +268,7 @@ print(f"Overall success rate: {success_rate:.1f}%")
 
 
 # --- SAVING WEIGHTS ---
-output_path = 'src/my_agent_dqn.pth'
+output_path = 'my_agent_dqn.pth'
 torch.save(ql_agent.policy_net.state_dict(), output_path)
 
 import json
@@ -283,7 +289,7 @@ save_weights_as_text(ql_agent.policy_net)
 
 
 # --- EVALUATION ---
-ql_agent.exploration_rate = 0.0 # Greedy policy for evaluation
+ql_agent.exploration_rate = 0.0 
 
 for scenario in ['training_3']:
     test_env = SailingEnv(**get_wind_scenario(scenario))
