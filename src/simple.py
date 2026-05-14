@@ -15,7 +15,6 @@ from agents.base_agent import BaseAgent
 
 np.random.seed(42)
 
-batch_size = 32
 
 
 class MLP(nn.Module):
@@ -160,6 +159,7 @@ class MyAgent(BaseAgent):
 
     def finish_episode(self, last_obs):
         """Compute GAE advantages and run PPO epochs. Call at episode end."""
+        batch_size = 32
         buf   = self._buf
         T     = len(buf['rewards'])
         if T == 0:
@@ -211,10 +211,8 @@ class MyAgent(BaseAgent):
 
                 logits = self.actor(b_feat)             # (batch_size, 9)
                 probs = torch.softmax(logits, dim=-1)   # (batch_size, 9)
-
-                action_probs = probs.gather(1, b_actions.unsqueeze(1)).squeeze(1)
-                
-                new_lp = torch.log(action_probs + 1e-8)
+                dist = Categorical(logits=logits)
+                new_lp = dist.log_prob(b_actions)
                 ratio = torch.exp(new_lp - b_old_lp)
                 
                 surr1 = ratio * b_adv
@@ -280,7 +278,7 @@ if __name__ == '__main__':
     SCENARIOS_TRAIN   = ['training_1', 'training_2']
     SCENARIO_VALID = 'training_3'
 
-    NUM_EPISODES = 600
+    NUM_EPISODES = 2000
     GOAL         = np.array([64.0, 127.0])
 
     agent = MyAgent(hidden=64, lr=3e-3, gamma=0.995, lam=0.95,
@@ -288,8 +286,8 @@ if __name__ == '__main__':
     agent.seed(42)
 
     
-    actor_scheduler = LinearLR(agent.actor_optim, start_factor=3e-3, end_factor=0.0, total_iters=NUM_EPISODES)
-    critic_scheduler = LinearLR(agent.critic_optim, start_factor=3e-3, end_factor=0.0, total_iters=NUM_EPISODES)
+    actor_scheduler = LinearLR(agent.actor_optim, start_factor=1, end_factor=0.0, total_iters=NUM_EPISODES)
+    critic_scheduler = LinearLR(agent.critic_optim, start_factor=1, end_factor=0.0, total_iters=NUM_EPISODES)
 
 
     best_success_rate = -1.0
@@ -364,9 +362,9 @@ if __name__ == '__main__':
             print(f"Episode {episode+1:4d} | success rate (last 100): {rate:.0%}")
 
         #validation
-        if (episode +1) % 20 == 0:
-            val_success, val_avg_steps = validate(agent, num_episodes=10)
-            print(f"Validation at episode {episode+1}: sucess={val_success:.2f}, avg_steps={val_avg_steps:.1f}")
+        if (episode + 1) % 20 == 0:
+            val_success, val_avg_steps = validate(agent, num_episodes=20) #more episodes to reduce noise impact
+            #print(f"Validation at episode {episode+1}: sucess={val_success:.2f}, avg_steps={val_avg_steps:.1f}")
             actor_scheduler.step()
             critic_scheduler.step()
 
@@ -377,7 +375,7 @@ if __name__ == '__main__':
                 print("best_success_rate", best_success_rate)
             elif val_success == best_success_rate and val_avg_steps < best_avg_steps: 
                 is_better = True
-                print("better found!")
+                print("better found! Average:", val_avg_steps)
             
             if is_better:
                 best_success_rate = val_success
@@ -386,7 +384,6 @@ if __name__ == '__main__':
                 agent.save()
     
 
-    # normally evaluation should use the last loaded model, so the best right?
 
     ### Evaluation 
 
@@ -408,7 +405,8 @@ if __name__ == '__main__':
                 if terminated or truncated:
                     break
 
-            disc = total_reward * (0.995 ** (step - 1)) if reached_goal else 0 # i should print this instead
-            print(f"  Ep {episode+1}: steps={step:3d}  reward={total_reward:.1f}"
+            disc = total_reward * (0.995 ** (step - 1)) if reached_goal else 0 
+            
+            print(f"  Ep {episode+1}: steps={step:3d}  discounted reward={disc:.1f}"
                   f"  pos={np.round(info['position'],1)}  reached={reached_goal}")
         print()
