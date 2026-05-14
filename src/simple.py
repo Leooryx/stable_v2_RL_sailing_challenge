@@ -4,7 +4,9 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LinearLR
 import json
+from torch.distributions import Categorical
 
 sys.path.append(os.path.abspath('../src'))
 sys.path.append(os.path.abspath('..'))
@@ -13,7 +15,7 @@ from agents.base_agent import BaseAgent
 
 np.random.seed(42)
 
-
+batch_size = 32
 
 
 class MLP(nn.Module):
@@ -27,7 +29,7 @@ class MLP(nn.Module):
         self.tanh = nn.Tanh()
         nn.init.xavier_uniform_(self.fc1.weight, gain=nn.init.calculate_gain('tanh'))
         nn.init.xavier_uniform_(self.fc2.weight, gain=nn.init.calculate_gain('tanh'))
-        nn.init.xavier_uniform_(self.fc3.weight, gain=1.0)  
+        nn.init.xavier_uniform_(self.fc3.weight, gain=0.01)  
         nn.init.zeros_(self.fc1.bias)
         nn.init.zeros_(self.fc2.bias)
         nn.init.zeros_(self.fc3.bias)
@@ -40,14 +42,11 @@ class MLP(nn.Module):
         return x
 
 
-# ─────────────────────────────────────────────
-#  State featuriser (unchanged)
-# ─────────────────────────────────────────────
 
 def featurise(obs):
     """
     Compact, normalised feature vector fed to the networks.
-    12 normalized features 
+    11 normalized features 
 
     """
 
@@ -106,8 +105,8 @@ class MyAgent(BaseAgent):
         self.critic = MLP(FEAT_DIM, hidden, 1)
 
         # Use SGD with momentum=0 (matches vanilla gradient descent)
-        self.actor_optim  = optim.SGD(self.actor.parameters(), lr=lr)
-        self.critic_optim = optim.SGD(self.critic.parameters(), lr=lr)
+        self.actor_optim  = optim.Adam(self.actor.parameters(), lr=lr)
+        self.critic_optim = optim.Adam(self.critic.parameters(), lr=lr)
 
         # Rollout buffer (filled during one episode, consumed at episode end)
         self._reset_buffer()
@@ -126,6 +125,7 @@ class MyAgent(BaseAgent):
 
     def act(self, obs):
         """Inference-only (no gradient). Used at test time."""
+        self.actor.eval()
         feat = featurise(obs)
         with torch.no_grad():
             feat_t = torch.from_numpy(feat).float()
@@ -133,21 +133,21 @@ class MyAgent(BaseAgent):
             probs = torch.softmax(logits, dim=-1).numpy()
         return int(np.argmax(probs))          
 
-    # Training interface
+    # Training 
 
     def act_train(self, obs):
         """Sample action and store transition info for PPO update."""
+        self.actor.train()
         feat = featurise(obs)
+        feat_t = torch.from_numpy(feat).float()
         with torch.no_grad():
-            feat_t = torch.from_numpy(feat).float()
             logits = self.actor(feat_t)
-            probs = torch.softmax(logits, dim=-1).numpy()
-        action = self.np_random.choice(9, p=probs)
-        log_p = np.log(probs[action] + 1e-8)
-        with torch.no_grad():
-            value = float(self.critic(feat_t).item())
-        self._cur = dict(feat=feat, action=action, log_p=log_p, value=value)
-        return int(action)
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            log_p = dist.log_prob(action)
+            value = self.critic(feat_t)
+        self._cur = dict(feat=feat, action=action.item(), log_p=log_p.item(), value=value.item())
+        return action.item()
 
     def store(self, reward, done):
         """Call after env.step() with the shaped reward."""
@@ -186,48 +186,52 @@ class MyAgent(BaseAgent):
 
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        feats   = buf['feats']         
-        actions = buf['actions']
-        old_lps = np.array(buf['log_ps'], dtype=np.float32)
+        feat_t    = torch.tensor(np.array(buf['feats']), dtype=torch.float32)
+        actions_t = torch.tensor(buf['actions'], dtype=torch.long) # Must be Long for gather()
+        old_lp_t  = torch.tensor(buf['log_ps'], dtype=torch.float32)
+        adv_t     = torch.tensor(adv, dtype=torch.float32)
+        ret_t     = torch.tensor(returns, dtype=torch.float32)
 
         # PPO update epochs 
         for _ in range(self.epochs):
             idx = self.np_random.permutation(T)
-            for i in idx:
-                feat   = feats[i]
-                a      = actions[i]
-                old_lp = old_lps[i]
-                Ai     = adv[i]
-                Ri     = returns[i]
+
+            for start_index in range(0, T, batch_size):
+                # Get the indices for the current batch (e.g., 0 to 32, 32 to 64)
+                batch_idx = idx[start_index : start_index + batch_size]
+                
+                b_feat    = feat_t[batch_idx]       # (batch_size, FEAT_DIM)
+                b_actions = actions_t[batch_idx]    # (batch_size,)
+                b_old_lp  = old_lp_t[batch_idx]     # (batch_size,)
+                b_adv     = adv_t[batch_idx]        # (batch_size,)
+                b_ret     = ret_t[batch_idx]        # (batch_size,)
 
 
-                feat_t = torch.from_numpy(feat).float().unsqueeze(0)  # (1, FEAT_DIM)
-                old_lp_t = torch.tensor(old_lp, dtype=torch.float32)
-                Ai_t = torch.tensor(Ai, dtype=torch.float32)
-                Ri_t = torch.tensor(Ri, dtype=torch.float32)
+                # actor update
 
-                # Actor loss (clipped surrogate)
-                logits = self.actor(feat_t).squeeze(0)   # (9,)
-                probs = torch.softmax(logits, dim=-1)
-                new_lp = torch.log(probs[a] + 1e-8)
-                ratio = torch.exp(new_lp - old_lp_t)
-                surr1 = ratio * Ai_t
-                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * Ai_t
-                actor_loss = -torch.min(surr1, surr2)
+                logits = self.actor(b_feat)             # (batch_size, 9)
+                probs = torch.softmax(logits, dim=-1)   # (batch_size, 9)
 
-                # Entropy bonus
-                entropy = -torch.sum(probs * torch.log(probs + 1e-8))
+                action_probs = probs.gather(1, b_actions.unsqueeze(1)).squeeze(1)
+                
+                new_lp = torch.log(action_probs + 1e-8)
+                ratio = torch.exp(new_lp - b_old_lp)
+                
+                surr1 = ratio * b_adv
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * b_adv
+                
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1).mean()
                 total_loss = actor_loss - self.ent_coef * entropy
 
-                # Update actor
                 self.actor_optim.zero_grad()
                 total_loss.backward()
                 self.actor_optim.step()
 
-                # Critic loss
-                v_pred = self.critic(feat_t).squeeze()
-                critic_loss = (v_pred - Ri_t) ** 2
-
+                # critic update
+                v_pred = self.critic(b_feat).squeeze(-1) 
+                critic_loss = ((v_pred - b_ret) ** 2).mean()
                 self.critic_optim.zero_grad()
                 critic_loss.backward()
                 self.critic_optim.step()
@@ -261,8 +265,6 @@ class MyAgent(BaseAgent):
         self.actor_optim.load_state_dict(checkpoint['actor_optim_state'])
         self.critic_optim.load_state_dict(checkpoint['critic_optim_state'])
 
-    # ── Internal ─────────────────────────────────────────────────────
-
     def _reset_buffer(self):
         self._buf = {k: [] for k in ('feats', 'actions', 'log_ps', 'values', 'rewards', 'dones')}
         self._cur = {}
@@ -285,8 +287,10 @@ if __name__ == '__main__':
                     clip_eps=0.2, epochs=4, ent_coef=0.01)
     agent.seed(42)
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(agent.actor_optim, mode='max', factor=0.5, patience=20, verbose=True)
-    # we also need to apply it to critic!
+    
+    actor_scheduler = LinearLR(agent.actor_optim, start_factor=3e-3, end_factor=0.0, total_iters=NUM_EPISODES)
+    critic_scheduler = LinearLR(agent.critic_optim, start_factor=3e-3, end_factor=0.0, total_iters=NUM_EPISODES)
+
 
     best_success_rate = -1.0
     best_avg_steps = float('inf')
@@ -363,7 +367,8 @@ if __name__ == '__main__':
         if (episode +1) % 20 == 0:
             val_success, val_avg_steps = validate(agent, num_episodes=10)
             print(f"Validation at episode {episode+1}: sucess={val_success:.2f}, avg_steps={val_avg_steps:.1f}")
-            scheduler.step(val_success)
+            actor_scheduler.step()
+            critic_scheduler.step()
 
             is_better = False
             if val_success > best_success_rate:
@@ -371,7 +376,6 @@ if __name__ == '__main__':
                 print("val_success", val_success)
                 print("best_success_rate", best_success_rate)
             elif val_success == best_success_rate and val_avg_steps < best_avg_steps: 
-                # sur que égalité pose pas de pb?
                 is_better = True
                 print("better found!")
             
