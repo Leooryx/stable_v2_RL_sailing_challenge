@@ -11,26 +11,23 @@ sys.path.append(os.path.abspath('..'))
 
 from agents.base_agent import BaseAgent
 
+np.random.seed(42)
 
-# ─────────────────────────────────────────────
-#  Tiny MLP (PyTorch, no manual backprop)
-#  Two hidden layers, tanh activations
-# ─────────────────────────────────────────────
+
+
 
 class MLP(nn.Module):
     """Two-hidden-layer MLP using PyTorch."""
 
     def __init__(self, in_dim, hidden, out_dim, rng=None):
         super().__init__()
-        # Use PyTorch's default Xavier initialization (similar to original)
         self.fc1 = nn.Linear(in_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, out_dim)
         self.tanh = nn.Tanh()
-        # Initialize weights with Xavier (same scale as original)
         nn.init.xavier_uniform_(self.fc1.weight, gain=nn.init.calculate_gain('tanh'))
         nn.init.xavier_uniform_(self.fc2.weight, gain=nn.init.calculate_gain('tanh'))
-        nn.init.xavier_uniform_(self.fc3.weight, gain=1.0)  # for linear output
+        nn.init.xavier_uniform_(self.fc3.weight, gain=1.0)  
         nn.init.zeros_(self.fc1.bias)
         nn.init.zeros_(self.fc2.bias)
         nn.init.zeros_(self.fc3.bias)
@@ -50,13 +47,10 @@ class MLP(nn.Module):
 def featurise(obs):
     """
     Compact, normalised feature vector fed to the networks.
-    12 features – all in roughly [-1, 1].
+    12 normalized features 
 
-    ... (entire function stays exactly as in original) ...
     """
-    # ... (original code unchanged) ...
-    # (We'll keep the exact same implementation as the user provided.)
-    # For brevity, I'm not repeating it here, but it remains identical.
+
     GRID = 128.0
     x_n = obs[0] / GRID - 0.5
     y_n = obs[1] / GRID - 0.5
@@ -80,17 +74,13 @@ def featurise(obs):
     return feat
 
 
-FEAT_DIM = 11   # must match len(featurise(obs))
+FEAT_DIM = 11  
 
-
-# ─────────────────────────────────────────────
-#  PPO Agent with PyTorch networks
-# ─────────────────────────────────────────────
 
 class MyAgent(BaseAgent):
     """
     Minimal PPO with separate actor/critic MLPs, GAE advantage estimation,
-    and clipped surrogate loss — now using PyTorch for efficiency.
+    and clipped surrogate loss
     """
 
     def __init__(
@@ -123,10 +113,9 @@ class MyAgent(BaseAgent):
         self._reset_buffer()
         self.np_random = np.random.default_rng()
 
-        # Set PyTorch seed for reproducibility
         torch.manual_seed(42)
 
-    # ── BaseAgent interface ──────────────────────────────────────────
+    # Obligatoire 
 
     def reset(self):
         self._reset_buffer()
@@ -142,9 +131,9 @@ class MyAgent(BaseAgent):
             feat_t = torch.from_numpy(feat).float()
             logits = self.actor(feat_t)
             probs = torch.softmax(logits, dim=-1).numpy()
-        return int(np.argmax(probs))          # greedy at test time
+        return int(np.argmax(probs))          
 
-    # ── Training interface ──────────────────────────────────────────
+    # Training interface
 
     def act_train(self, obs):
         """Sample action and store transition info for PPO update."""
@@ -185,7 +174,7 @@ class MyAgent(BaseAgent):
         values   = np.array(buf['values'],   dtype=np.float32)
         dones    = np.array(buf['dones'],    dtype=np.float32)
 
-        # ── GAE (Generalised Advantage Estimation) ───────────────────
+        # GAE (Generalised Advantage Estimation) 
         adv     = np.zeros(T, dtype=np.float32)
         gae     = 0.0
         vals_ext = np.append(values, last_val)
@@ -195,14 +184,13 @@ class MyAgent(BaseAgent):
             adv[t] = gae
         returns = adv + values
 
-        # Normalise advantages
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        feats   = buf['feats']          # list of numpy arrays
+        feats   = buf['feats']         
         actions = buf['actions']
         old_lps = np.array(buf['log_ps'], dtype=np.float32)
 
-        # ── PPO update epochs ────────────────────────────────────────
+        # PPO update epochs 
         for _ in range(self.epochs):
             idx = self.np_random.permutation(T)
             for i in idx:
@@ -212,13 +200,13 @@ class MyAgent(BaseAgent):
                 Ai     = adv[i]
                 Ri     = returns[i]
 
-                # Convert to torch tensors
+
                 feat_t = torch.from_numpy(feat).float().unsqueeze(0)  # (1, FEAT_DIM)
                 old_lp_t = torch.tensor(old_lp, dtype=torch.float32)
                 Ai_t = torch.tensor(Ai, dtype=torch.float32)
                 Ri_t = torch.tensor(Ri, dtype=torch.float32)
 
-                # ── Actor loss (clipped surrogate) ───────────────────
+                # Actor loss (clipped surrogate)
                 logits = self.actor(feat_t).squeeze(0)   # (9,)
                 probs = torch.softmax(logits, dim=-1)
                 new_lp = torch.log(probs[a] + 1e-8)
@@ -236,7 +224,7 @@ class MyAgent(BaseAgent):
                 total_loss.backward()
                 self.actor_optim.step()
 
-                # ── Critic loss (MSE) ─────────────────────────────────
+                # Critic loss
                 v_pred = self.critic(feat_t).squeeze()
                 critic_loss = (v_pred - Ri_t) ** 2
 
@@ -246,7 +234,6 @@ class MyAgent(BaseAgent):
 
         self._reset_buffer()
 
-    # ── Persistence ─────────────────────────────────────────────────
 
     def save(self, path='ppo_weights.txt'):
         torch_path = path.replace('.txt', '.pt')
@@ -266,9 +253,6 @@ class MyAgent(BaseAgent):
             f.write("RAW_WEIGHTS = ")
             json.dump(raw_weights, f)
         
-        print(f"Binary weights saved to {torch_path}")
-        print(f"Text weights (JSON) saved to {path}")
-
 
     def load(self, path='ppo_weights.pt'):
         checkpoint = torch.load(path)
@@ -284,40 +268,72 @@ class MyAgent(BaseAgent):
         self._cur = {}
 
 
-# ─────────────────────────────────────────────
-#  Training script (unchanged except save path)
-# ─────────────────────────────────────────────
+### Training:
 
 if __name__ == '__main__':
     from tqdm import tqdm
     from env_sailing import SailingEnv
     from wind_scenarios import get_wind_scenario
 
-    SCENARIOS   = ['training_1', 'training_2']
-    NUM_EPISODES = 100
+    SCENARIOS_TRAIN   = ['training_1', 'training_2']
+    SCENARIO_VALID = 'training_3'
+
+    NUM_EPISODES = 600
     GOAL         = np.array([64.0, 127.0])
 
     agent = MyAgent(hidden=64, lr=3e-3, gamma=0.995, lam=0.95,
                     clip_eps=0.2, epochs=4, ent_coef=0.01)
     agent.seed(42)
 
-    success_log = []
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(agent.actor_optim, mode='max', factor=0.5, patience=20, verbose=True)
+    # we also need to apply it to critic!
 
-    for episode in tqdm(range(NUM_EPISODES)):
-        scenario = SCENARIOS[episode % len(SCENARIOS)]
+    best_success_rate = -1.0
+    best_avg_steps = float('inf')
+    best_episode = -1
+
+    success_log = []
+    steps_log = []
+
+    def validate(agent, num_episodes=10, max_steps=500):
+        successes = 0
+        steps_list = []
+        for ep in range(num_episodes):
+            env = SailingEnv(**get_wind_scenario(SCENARIO_VALID))
+            obs, info = env.reset(seed=ep + 1000)
+            reached = False
+            for step in range(1, max_steps +1):
+                action = agent.act(obs)
+                obs, reward, terminated, truncated, info = env.step(action)
+                if np.linalg.norm(info['position'] - GOAL) < 1.5:
+                    reached = True
+                    break
+                if terminated or truncated:
+                    break
+            if reached:
+                successes += 1
+                steps_list.append(step)
+        success_rate = successes / num_episodes
+        avg_steps = np.mean(steps_list) if steps_list else float('inf')
+        return success_rate, avg_steps
+
+
+    for episode in tqdm(range(NUM_EPISODES), ):
+        scenario = SCENARIOS_TRAIN[episode % len(SCENARIOS_TRAIN)]
         env = SailingEnv(**get_wind_scenario(scenario))
         obs, info = env.reset(seed=episode)
         agent.reset()
 
         prev_dist = np.linalg.norm(info['position'] - GOAL)
         done_flag = False
+        steps_taken = 0
 
         for step in range(500):
             action = agent.act_train(obs)
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+            steps_taken = step + 1
 
-            # Reward shaping (same as before)
             curr_dist = np.linalg.norm(info['position'] - GOAL)
             shaped    = reward + (prev_dist - curr_dist) * 0.5
             if info.get('is_stuck', False):
@@ -334,15 +350,43 @@ if __name__ == '__main__':
         agent.finish_episode(obs)
         success_log.append(done_flag)
 
+        if done_flag:
+            steps_log.append(steps_taken)
+        else:
+            steps_log.append(None)
+
         if (episode + 1) % 100 == 0:
             rate = sum(success_log[-100:]) / 100
             print(f"Episode {episode+1:4d} | success rate (last 100): {rate:.0%}")
 
-    agent.save()
-    print("\nTraining done. Running evaluation...\n")
+        #validation
+        if (episode +1) % 20 == 0:
+            val_success, val_avg_steps = validate(agent, num_episodes=10)
+            print(f"Validation at episode {episode+1}: sucess={val_success:.2f}, avg_steps={val_avg_steps:.1f}")
+            scheduler.step(val_success)
 
+            is_better = False
+            if val_success > best_success_rate:
+                is_better = True
+                print("val_success", val_success)
+                print("best_success_rate", best_success_rate)
+            elif val_success == best_success_rate and val_avg_steps < best_avg_steps: 
+                # sur que égalité pose pas de pb?
+                is_better = True
+                print("better found!")
+            
+            if is_better:
+                best_success_rate = val_success
+                best_avg_steps = val_avg_steps
+                best_episode = episode
+                agent.save()
+    
 
-    # ── Evaluation ──────────────────────────────────────────────────
+    # normally evaluation should use the last loaded model, so the best right?
+
+    ### Evaluation 
+
+    agent.load() #loads the best
     for scenario in ['training_1', 'training_2', 'training_3']:
         test_env = SailingEnv(**get_wind_scenario(scenario))
         print(f"TEST ON SCENARIO {scenario}")
@@ -360,7 +404,7 @@ if __name__ == '__main__':
                 if terminated or truncated:
                     break
 
-            disc = total_reward * (0.995 ** (step - 1)) if reached_goal else 0
+            disc = total_reward * (0.995 ** (step - 1)) if reached_goal else 0 # i should print this instead
             print(f"  Ep {episode+1}: steps={step:3d}  reward={total_reward:.1f}"
                   f"  pos={np.round(info['position'],1)}  reached={reached_goal}")
         print()
