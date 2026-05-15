@@ -15,10 +15,12 @@ from agents.base_agent import BaseAgent
 
 np.random.seed(42)
 
+# if the ersion of cuda is too old, to this:
+#pip uninstall torch torchvision torchaudio
+#pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 
 class MLP(nn.Module):
-    """Two-hidden-layer MLP using PyTorch."""
 
     def __init__(self, in_dim, hidden, out_dim, rng=None):
         super().__init__()
@@ -42,44 +44,58 @@ class MLP(nn.Module):
 
 
 
-def featurise(obs):
-    """
-    Compact, normalised feature vector fed to the networks.
-    11 normalized features 
-
-    """
-
+def featurise(observation):
     GRID = 128.0
-    x_n = obs[0] / GRID - 0.5
-    y_n = obs[1] / GRID - 0.5
-    vx, vy = obs[2], obs[3]
-    wx, wy = obs[4], obs[5]
+    x, y = observation[0], observation[1]
+    vx, vy = observation[2], observation[3]
+    wx, wy = observation[4], observation[5]
+
+    x_n = x / GRID - 0.5
+    y_n = y / GRID - 0.5
+
     w_norm = np.sqrt(wx**2 + wy**2) + 1e-8
     wx_u, wy_u = wx / w_norm, wy / w_norm
-    w_log = np.log1p(w_norm) / 4.0
+    w_log = np.log1p(w_norm) / 4.0  
     gx, gy = 64.0, 127.0
-    dx, dy = (gx - obs[0]) / GRID, (gy - obs[1]) / GRID
-    dist = np.sqrt(dx**2 + dy**2) + 1e-8
-    dx_u, dy_u = dx / dist, dy / dist
-    dist_n = dist
+    dx, dy = (gx - x) / GRID, (gy - y) / GRID
+    dist_n = np.sqrt(dx**2 + dy**2) + 1e-8
+    dx_u, dy_u = dx / dist_n, dy / dist_n
+
+    # how much is the wind helping/hindering the path to the goal
     dot_goal_wind = dx_u * wx_u + dy_u * wy_u
-    feat = np.array([
-        x_n, y_n, vx, vy,
-        wx_u, wy_u, w_log,
-        dx_u, dy_u, dist_n,
-        dot_goal_wind,
+    v_progression = (vx * dx_u) + (vy * dy_u)
+
+    # danger radar 
+    danger = 0.0
+    speed = np.sqrt(vx**2 + vy**2)
+    if speed > 0.1:
+        # Predict where we will be in 2 time-steps
+        look_x = int(np.clip(x + vx * 2, 0, 127))
+        look_y = int(np.clip(y + vy * 2, 0, 127))
+        map_idx = (6 + 32768) + (look_y * 128 + look_x)
+        if map_idx < len(observation) and observation[map_idx] == 1:
+            danger = 1.0
+
+    return np.array([
+        x_n, y_n,           
+        vx, vy,             
+        wx_u, wy_u, w_log,  
+        dx_u, dy_u, dist_n, 
+        dot_goal_wind,  
+        v_progression,    
+        danger              
     ], dtype=np.float32)
-    return feat
 
 
-FEAT_DIM = 11  
+
+
+FEAT_DIM = 13  
 
 
 class MyAgent(BaseAgent):
-    """
-    Minimal PPO with separate actor/critic MLPs, GAE advantage estimation,
-    and clipped surrogate loss
-    """
+    
+    #Algorithm used: PPO with actor/critic MLPs, GAE advantage estimation
+    
 
     def __init__(
         self,
@@ -99,15 +115,12 @@ class MyAgent(BaseAgent):
         self.ent_coef = ent_coef
         self.lr       = lr
 
-        # PyTorch networks
         self.actor  = MLP(FEAT_DIM, hidden, 9)
         self.critic = MLP(FEAT_DIM, hidden, 1)
 
-        # Use SGD with momentum=0 (matches vanilla gradient descent)
-        self.actor_optim  = optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_optim = optim.Adam(self.critic.parameters(), lr=lr)
+        self.actor_optim  = optim.AdamW(self.actor.parameters(), lr=lr, eps=1e-5)
+        self.critic_optim = optim.AdamW(self.critic.parameters(), lr=lr*2, eps=1e-5)
 
-        # Rollout buffer (filled during one episode, consumed at episode end)
         self._reset_buffer()
         self.np_random = np.random.default_rng()
 
@@ -123,7 +136,6 @@ class MyAgent(BaseAgent):
         torch.manual_seed(seed)
 
     def act(self, obs):
-        """Inference-only (no gradient). Used at test time."""
         self.actor.eval()
         feat = featurise(obs)
         with torch.no_grad():
@@ -132,10 +144,10 @@ class MyAgent(BaseAgent):
             probs = torch.softmax(logits, dim=-1).numpy()
         return int(np.argmax(probs))          
 
+
     # Training 
 
     def act_train(self, obs):
-        """Sample action and store transition info for PPO update."""
         self.actor.train()
         feat = featurise(obs)
         feat_t = torch.from_numpy(feat).float()
@@ -149,7 +161,7 @@ class MyAgent(BaseAgent):
         return action.item()
 
     def store(self, reward, done):
-        """Call after env.step() with the shaped reward."""
+        #Call after env.step() with the shaped reward.
         self._buf['feats'].append(self._cur['feat'])
         self._buf['actions'].append(self._cur['action'])
         self._buf['log_ps'].append(self._cur['log_p'])
@@ -158,7 +170,7 @@ class MyAgent(BaseAgent):
         self._buf['dones'].append(float(done))
 
     def finish_episode(self, last_obs):
-        """Compute GAE advantages and run PPO epochs. Call at episode end."""
+        #Compute GAE advantages and run PPO epochs. Call at episode end.
         batch_size = 32
         buf   = self._buf
         T     = len(buf['rewards'])
@@ -278,7 +290,7 @@ if __name__ == '__main__':
     SCENARIOS_TRAIN   = ['training_1', 'training_2']
     SCENARIO_VALID = 'training_3'
 
-    NUM_EPISODES = 2000
+    NUM_EPISODES = 1500
     GOAL         = np.array([64.0, 127.0])
 
     agent = MyAgent(hidden=64, lr=3e-3, gamma=0.995, lam=0.95,
