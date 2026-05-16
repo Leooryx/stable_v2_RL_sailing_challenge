@@ -27,7 +27,7 @@ class MLP(nn.Module):
         self.fc1 = nn.Linear(in_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, out_dim)
-        self.tanh = nn.Tanh()
+        self.activ = nn.Tanh() #nn.GELU(approximate='tanh') #
         nn.init.xavier_uniform_(self.fc1.weight, gain=nn.init.calculate_gain('tanh'))
         nn.init.xavier_uniform_(self.fc2.weight, gain=nn.init.calculate_gain('tanh'))
         nn.init.xavier_uniform_(self.fc3.weight, gain=0.01)  
@@ -37,8 +37,8 @@ class MLP(nn.Module):
 
     def forward(self, x):
         # x is a torch tensor
-        x = self.tanh(self.fc1(x))
-        x = self.tanh(self.fc2(x))
+        x = self.activ(self.fc1(x))
+        x = self.activ(self.fc2(x))
         x = self.fc3(x)
         return x
 
@@ -63,7 +63,6 @@ def featurise(observation):
 
     # how much is the wind helping/hindering the path to the goal
     dot_goal_wind = dx_u * wx_u + dy_u * wy_u
-    v_progression = (vx * dx_u) + (vy * dy_u)
 
     # danger radar 
     danger = 0.0
@@ -76,35 +75,55 @@ def featurise(observation):
         if map_idx < len(observation) and observation[map_idx] == 1:
             danger = 1.0
 
-    return np.array([
-        x_n, y_n,           
-        vx, vy,             
-        wx_u, wy_u, w_log,  
-        dx_u, dy_u, dist_n, 
-        dot_goal_wind,  
-        v_progression,    
-        danger              
-    ], dtype=np.float32)
+    base_features = np.array([x_n, y_n, vx, vy, wx_u, wy_u, w_log, dx_u, dy_u, dist_n, dot_goal_wind, danger], dtype=np.float32)
+    
+    strategic_features = []
+    wind_field = obs[6:32774].reshape(128, 128, 2)
+    world_map = obs[32774:49158].reshape(128, 128)
 
+    mid_x = int(np.clip((x + gx) / 2, 0, 127))
+    mid_y = int(np.clip((y + gy) / 2, 0, 127))
+    
+    cross_track = 20  
+    if wx < 0:  # wind from left
+        tack_x = int(np.clip(mid_x + cross_track, 0, 127))
+    else:
+        tack_x = int(np.clip(mid_x - cross_track, 0, 127))
+    tack_y = mid_y
+    
+    for px, py in [(mid_x, mid_y), (tack_x, tack_y)]:
+        island = world_map[py, px]
+        
+        wind_at = wind_field[px, py, :] #px py or py px?
+        wind_speed = np.sqrt(wind_at[0]**2 + wind_at[1]**2)
+        wind_dir = np.arctan2(wind_at[1], wind_at[0])
+        
+        strategic_features.extend([
+            float(island),
+            wind_speed / 5.0,
+            np.cos(wind_dir),
+            np.sin(wind_dir)
+        ])
+    
+    return np.concatenate([base_features, np.array(strategic_features)])
+     
 
-
-
-FEAT_DIM = 13  
+FEAT_DIM = 12 + 8
 
 
 class MyAgent(BaseAgent):
     
-    #Algorithm used: PPO with actor/critic MLPs, GAE advantage estimation
+    #Algorithms used: PPO with actor/critic MLPs, GAE advantage estimation
     
 
     def __init__(
         self,
         hidden=64,
-        lr=3e-3,
+        lr=3e-4,
         gamma=0.995,
         lam=0.95,
         clip_eps=0.2,
-        epochs=4,
+        epochs=8,
         ent_coef=0.01,
     ):
         super().__init__()
@@ -171,9 +190,9 @@ class MyAgent(BaseAgent):
 
     def finish_episode(self, last_obs):
         #Compute GAE advantages and run PPO epochs. Call at episode end.
-        batch_size = 32
-        buf   = self._buf
-        T     = len(buf['rewards'])
+        batch_size = 64
+        buf = self._buf
+        T = len(buf['rewards'])
         if T == 0:
             return
 
@@ -182,27 +201,28 @@ class MyAgent(BaseAgent):
         with torch.no_grad():
             last_val = float(self.critic(torch.from_numpy(last_feat).float()).item())
 
-        rewards  = np.array(buf['rewards'],  dtype=np.float32)
-        values   = np.array(buf['values'],   dtype=np.float32)
-        dones    = np.array(buf['dones'],    dtype=np.float32)
+        rewards = np.array(buf['rewards'],  dtype=np.float32)
+        values = np.array(buf['values'],   dtype=np.float32)
+        dones  = np.array(buf['dones'],    dtype=np.float32)
 
         # GAE (Generalised Advantage Estimation) 
-        adv     = np.zeros(T, dtype=np.float32)
-        gae     = 0.0
+        adv = np.zeros(T, dtype=np.float32)
+        gae = 0.0
         vals_ext = np.append(values, last_val)
         for t in reversed(range(T)):
-            delta  = rewards[t] + self.gamma * vals_ext[t+1] * (1 - dones[t]) - vals_ext[t]
-            gae    = delta + self.gamma * self.lam * (1 - dones[t]) * gae
+            delta = rewards[t] + self.gamma * vals_ext[t+1] * (1 - dones[t]) - vals_ext[t]
+            gae = delta + self.gamma * self.lam * (1 - dones[t]) * gae
             adv[t] = gae
         returns = adv + values
 
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        feat_t    = torch.tensor(np.array(buf['feats']), dtype=torch.float32)
+        feat_t = torch.tensor(np.array(buf['feats']), dtype=torch.float32)
         actions_t = torch.tensor(buf['actions'], dtype=torch.long) # Must be Long for gather()
-        old_lp_t  = torch.tensor(buf['log_ps'], dtype=torch.float32)
-        adv_t     = torch.tensor(adv, dtype=torch.float32)
-        ret_t     = torch.tensor(returns, dtype=torch.float32)
+        old_lp_t = torch.tensor(buf['log_ps'], dtype=torch.float32)
+        adv_t = torch.tensor(adv, dtype=torch.float32)
+        ret_t = torch.tensor(returns, dtype=torch.float32)
+        ret_t = (ret_t - ret_t.mean()) / (ret_t.std() + 1e-8)
 
         # PPO update epochs 
         for _ in range(self.epochs):
@@ -212,11 +232,11 @@ class MyAgent(BaseAgent):
                 # Get the indices for the current batch (e.g., 0 to 32, 32 to 64)
                 batch_idx = idx[start_index : start_index + batch_size]
                 
-                b_feat    = feat_t[batch_idx]       # (batch_size, FEAT_DIM)
+                b_feat = feat_t[batch_idx]       # (batch_size, FEAT_DIM)
                 b_actions = actions_t[batch_idx]    # (batch_size,)
-                b_old_lp  = old_lp_t[batch_idx]     # (batch_size,)
-                b_adv     = adv_t[batch_idx]        # (batch_size,)
-                b_ret     = ret_t[batch_idx]        # (batch_size,)
+                b_old_lp = old_lp_t[batch_idx]     # (batch_size,)
+                b_adv = adv_t[batch_idx]        # (batch_size,)
+                b_ret = ret_t[batch_idx]        # (batch_size,)
 
 
                 # actor update
@@ -287,14 +307,14 @@ if __name__ == '__main__':
     from env_sailing import SailingEnv
     from wind_scenarios import get_wind_scenario
 
-    SCENARIOS_TRAIN   = ['training_1', 'training_2']
+    SCENARIOS_TRAIN = ['training_1', 'training_2']
     SCENARIO_VALID = 'training_3'
 
-    NUM_EPISODES = 1500
-    GOAL         = np.array([64.0, 127.0])
+    NUM_EPISODES = 1000
+    GOAL = np.array([64.0, 127.0])
 
-    agent = MyAgent(hidden=64, lr=3e-3, gamma=0.995, lam=0.95,
-                    clip_eps=0.2, epochs=4, ent_coef=0.01)
+    agent = MyAgent(hidden=64, lr=3e-4, gamma=0.995, lam=0.95,
+                    clip_eps=0.2, epochs=8, ent_coef=0.01)
     agent.seed(42)
 
     
@@ -349,7 +369,10 @@ if __name__ == '__main__':
             steps_taken = step + 1
 
             curr_dist = np.linalg.norm(info['position'] - GOAL)
-            shaped    = reward + (prev_dist - curr_dist) * 0.5
+            step_penalty = -0.01 
+            # we try to direclty penalize the amount of steps taken, but must not be too high compared to goal reward obv
+            
+            shaped = reward + (prev_dist - curr_dist) * 0.5 + step_penalty
             if info.get('is_stuck', False):
                 shaped = -15.0
             prev_dist = curr_dist
@@ -358,7 +381,7 @@ if __name__ == '__main__':
             obs = next_obs
 
             if done:
-                done_flag = terminated   # True only if goal reached
+                done_flag = terminated  
                 break
 
         agent.finish_episode(obs)
